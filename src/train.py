@@ -1,4 +1,5 @@
-"""Training script for crash detection model."""
+%%writefile /content/Kaggle-Assignment2/src/train.py
+"""Training script for crash detection model with resume capability."""
 import sys
 import pandas as pd
 import numpy as np
@@ -35,7 +36,6 @@ class LabelSmoothingBCEWithLogitsLoss(nn.Module):
 
 
 def train_epoch(model, loader, criterion, optimizer, scaler, device, config):
-    """Train for one epoch."""
     model.train()
     loss_meter = AverageMeter()
 
@@ -46,16 +46,13 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, config):
         frames = frames.to(device)
         labels = labels.to(device)
 
-        # Forward pass with AMP
         with torch.amp.autocast('cuda', dtype=torch.float16):
             logits = model(frames)
             loss = criterion(logits, labels)
             loss = loss / config.accum_steps
 
-        # Backward pass
         scaler.scale(loss).backward()
 
-        # Update weights every accum_steps
         if (batch_idx + 1) % config.accum_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip_max_norm)
@@ -71,7 +68,6 @@ def train_epoch(model, loader, criterion, optimizer, scaler, device, config):
 
 @torch.no_grad()
 def validate(model, loader, device):
-    """Validate and return predictions and labels."""
     model.eval()
     all_preds = []
     all_labels = []
@@ -80,7 +76,6 @@ def validate(model, loader, device):
     for frames, labels in pbar:
         frames = frames.to(device)
 
-        # Forward pass
         logits = model(frames)
         probs = torch.sigmoid(logits)
 
@@ -95,13 +90,13 @@ def validate(model, loader, device):
 
 
 def train_fold(fold, train_df, val_df, config, device):
-    """Train a single fold."""
     print(f"\n{'='*60}")
     print(f"Training Fold {fold}")
     print(f"{'='*60}")
-    print(f"Train size: {len(train_df)}, Val size: {len(val_df)}")
 
-    # Create datasets
+    ckpt_path = config.CHECKPOINT_DIR / f"fold_{fold}_best.pth"
+
+    # Create datasets & loaders
     train_dataset = CrashVideoDataset(
         clip_ids=train_df['clip_id'].values,
         labels=train_df['label'].values,
@@ -120,7 +115,6 @@ def train_fold(fold, train_df, val_df, config, device):
         config=config
     )
 
-    # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -140,10 +134,17 @@ def train_fold(fold, train_df, val_df, config, device):
         persistent_workers=config.persistent_workers
     )
 
-    # Create model
     model = CrashR2Plus1D(config).to(device)
 
-    # Optimizer with differential learning rates
+    # If checkpoint exists, skip training this fold and just evaluate
+    if ckpt_path.exists():
+        print(f"[FOUND] Existing checkpoint {ckpt_path}. Loading and evaluating...")
+        checkpoint = torch.load(ckpt_path, map_location=device)
+        model.load_state_dict(checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint)
+        val_auc, val_preds, val_labels = validate(model, val_loader, device)
+        print(f"Loaded Fold {fold} AUC: {val_auc:.4f}")
+        return val_df['clip_id'].values, val_preds, val_labels, val_auc
+
     backbone_params = []
     head_params = []
     for name, param in model.named_parameters():
@@ -157,18 +158,10 @@ def train_fold(fold, train_df, val_df, config, device):
         {'params': head_params, 'lr': config.lr_head}
     ], weight_decay=config.weight_decay)
 
-    # Scheduler with warmup
-    scheduler = WarmupCosineScheduler(
-        optimizer,
-        warmup_epochs=3,
-        total_epochs=config.epochs
-    )
-
-    # Loss and scaler
+    scheduler = WarmupCosineScheduler(optimizer, warmup_epochs=3, total_epochs=config.epochs)
     criterion = LabelSmoothingBCEWithLogitsLoss(smoothing=config.label_smoothing)
     scaler = torch.amp.GradScaler('cuda')
 
-    # Training loop
     best_auc = 0.0
     patience_counter = 0
 
@@ -176,15 +169,11 @@ def train_fold(fold, train_df, val_df, config, device):
         print(f"\nEpoch {epoch + 1}/{config.epochs}")
         print(f"LR: {optimizer.param_groups[0]['lr']:.2e} (backbone), {optimizer.param_groups[1]['lr']:.2e} (head)")
 
-        # Train
         train_loss = train_epoch(model, train_loader, criterion, optimizer, scaler, device, config)
-
-        # Validate
         val_auc, val_preds, val_labels = validate(model, val_loader, device)
 
         print(f"Train Loss: {train_loss:.4f} | Val AUC: {val_auc:.4f}")
 
-        # Save best model
         if val_auc > best_auc:
             best_auc = val_auc
             patience_counter = 0
@@ -196,47 +185,30 @@ def train_fold(fold, train_df, val_df, config, device):
             patience_counter += 1
             print(f"[INFO] No improvement ({patience_counter}/{config.patience})")
 
-        # Early stopping
         if patience_counter >= config.patience:
             print(f"\nEarly stopping triggered after {epoch + 1} epochs")
             break
 
-        # Step scheduler
         scheduler.step()
 
     print(f"\nFold {fold} Best AUC: {best_auc:.4f}")
-
-    # Return validation predictions for OOF
     return val_df['clip_id'].values, val_preds, val_labels, best_auc
 
 
 def main():
-    """Main training function."""
-    # Setup
     set_seed(config.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
 
-    # Create output directories
     config.CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     config.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Load data
-    print("\nLoading training labels...")
     df = pd.read_csv(config.LABELS_PATH)
-    print(f"Total clips: {len(df)}")
-    print(f"Crash: {(df['label'] == 1).sum()}, Non-crash: {(df['label'] == 0).sum()}")
-    print(f"Unique groups: {df['group_id'].nunique()}")
-
-    # Create folds
-    print("\nCreating GroupKFold splits...")
     df = get_group_kfold_splits(df, n_splits=config.n_folds, seed=config.seed)
 
-    # Track OOF predictions
     oof_predictions = []
-
-    # Train each fold
     fold_aucs = []
+
     for fold in range(config.n_folds):
         train_df = df[df['fold'] != fold].reset_index(drop=True)
         val_df = df[df['fold'] == fold].reset_index(drop=True)
@@ -244,7 +216,6 @@ def main():
         clip_ids, preds, labels, best_auc = train_fold(fold, train_df, val_df, config, device)
         fold_aucs.append(best_auc)
 
-        # Store OOF predictions
         for clip_id, pred, label in zip(clip_ids, preds, labels):
             oof_predictions.append({
                 'clip_id': clip_id,
@@ -253,16 +224,12 @@ def main():
                 'label': label
             })
 
-    # Save OOF predictions
     oof_df = pd.DataFrame(oof_predictions)
     oof_path = config.OUTPUT_DIR / 'oof_predictions.csv'
     oof_df.to_csv(oof_path, index=False)
     print(f"\n[SAVED] OOF predictions to {oof_path}")
 
-    # Calculate overall OOF AUC
     overall_auc = roc_auc_score(oof_df['label'], oof_df['prediction'])
-
-    # Print summary
     print("\n" + "="*60)
     print("TRAINING SUMMARY")
     print("="*60)
